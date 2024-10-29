@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h>
 
 #include "queue.h"
 #include "tls.h"
@@ -370,18 +371,27 @@ static void notify_worker_fd(LIBEVENT_THREAD *t, int sfd, enum conn_queue_item_m
 }
 
 /*
- * Creates a worker thread.
+ * Creates a worker thread and pins it to a specific CPU core.
  */
-static void create_worker(void *(*func)(void *), void *arg) {
+static void create_worker(void *(*func)(void *), void *arg, int core_id) {
     pthread_attr_t  attr;
     int             ret;
 
     pthread_attr_init(&attr);
 
     if ((ret = pthread_create(&((LIBEVENT_THREAD*)arg)->thread_id, &attr, func, arg)) != 0) {
-        fprintf(stderr, "Can't create thread: %s\n",
-                strerror(ret));
+        fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
         exit(1);
+    }
+
+    // Set CPU affinity for the thread
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+
+    ret = pthread_setaffinity_np(((LIBEVENT_THREAD*)arg)->thread_id, sizeof(cpu_set_t), &cpuset);
+    if (ret != 0) {
+        fprintf(stderr, "Error setting thread affinity: %s\n", strerror(ret));
     }
 
     thread_setname(((LIBEVENT_THREAD*)arg)->thread_id, "mc-worker");
@@ -1082,6 +1092,7 @@ static void memcached_thread_notify_init(struct thread_notify *tn) {
 void memcached_thread_init(int nthreads, void *arg) {
     int         i;
     int         power;
+    int         num_cores = sysconf(_SC_NPROCESSORS_ONLN); // Get number of available cores
 
     for (i = 0; i < POWER_LARGEST; i++) {
         pthread_mutex_init(&lru_locks[i], NULL);
@@ -1146,7 +1157,8 @@ void memcached_thread_init(int nthreads, void *arg) {
 
     /* Create threads after we've done all the libevent setup. */
     for (i = 0; i < nthreads; i++) {
-        create_worker(worker_libevent, &threads[i]);
+        int core_id = i % num_cores; // Round-robin core assignment
+        create_worker(worker_libevent, &threads[i], core_id);
     }
 
     /* Wait for all the threads to set themselves up before returning. */
